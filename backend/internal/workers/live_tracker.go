@@ -19,12 +19,22 @@ import (
 // LiveTracker polls the sports provider for every team that has at least one
 // live-update subscriber, persists the latest game state, and dispatches a
 // notification when the score changes.
+//
+// It also runs a small housekeeping pass at the end of every tick to delete
+// finished games (and their cascading game_events) older than
+// FinishedGameRetention, so the games table doesn't grow unbounded.
 type LiveTracker struct {
 	Repo       *repo.Repo
 	Sports     sports.Provider
 	Dispatcher *services.Dispatcher
 	Log        *slog.Logger
 	Interval   time.Duration
+	// FinishedGameRetention is how long a finished game stays in the DB
+	// before it (and its game_events) are deleted. Zero disables
+	// housekeeping; useful in tests.
+	FinishedGameRetention time.Duration
+	// Now allows tests to inject a fixed clock for housekeeping.
+	Now func() time.Time
 }
 
 func (t *LiveTracker) Run(ctx context.Context) {
@@ -75,7 +85,32 @@ func (t *LiveTracker) Tick(ctx context.Context) error {
 			t.processGame(ctx, team, g, subs)
 		}
 	}
+
+	t.housekeep(ctx)
 	return nil
+}
+
+// housekeep deletes finished games older than the retention window. We
+// run it at the end of every Tick rather than in a separate goroutine so
+// there's only one source of writes to the games table from this worker.
+func (t *LiveTracker) housekeep(ctx context.Context) {
+	if t.FinishedGameRetention <= 0 {
+		return
+	}
+	now := time.Now().UTC()
+	if t.Now != nil {
+		now = t.Now()
+	}
+	cutoff := now.Add(-t.FinishedGameRetention)
+	n, err := t.Repo.DeleteFinishedGamesBefore(ctx, cutoff)
+	if err != nil {
+		t.Log.Warn("delete finished games failed", "err", err)
+		return
+	}
+	if n > 0 {
+		t.Log.Info("games_deleted", "count", n,
+			"cutoff", cutoff.Format(time.RFC3339))
+	}
 }
 
 func (t *LiveTracker) processGame(ctx context.Context, team models.Team, g sports.LiveGame, subs []models.SubscriptionDetail) {

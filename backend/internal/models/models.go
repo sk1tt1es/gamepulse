@@ -123,6 +123,14 @@ type Subscription struct {
 	UpdateType UpdateType `json:"update_type"`
 	Frequency  Frequency  `json:"frequency"`
 	CreatedAt  time.Time  `json:"created_at"`
+	// InitialNewsSent flips to true after the +5m initial news digest
+	// has been delivered for this subscription. Live-only subs are
+	// created with this already true so they're never picked up by the
+	// initial-send query.
+	InitialNewsSent bool `json:"initial_news_sent"`
+	// InitialNewsNotBefore is the earliest UTC instant at which the
+	// initial news digest is allowed to fire. Nil for live-only subs.
+	InitialNewsNotBefore *time.Time `json:"initial_news_not_before,omitempty"`
 }
 
 // SubscriptionDetail joins user and team info for read endpoints.

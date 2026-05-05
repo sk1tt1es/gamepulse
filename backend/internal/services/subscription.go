@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/gamepulse/backend/internal/models"
 	"github.com/gamepulse/backend/internal/providers/sms"
@@ -58,10 +59,21 @@ type SubscriptionService struct {
 	Repo *repo.Repo
 	SMS  sms.Sender
 	Log  *slog.Logger
+
+	// InitialNewsDelay is the cooldown between subscribe and the very
+	// first news digest for news/both subs. Zero means "use default 5m".
+	InitialNewsDelay time.Duration
+	// Now is the clock used for stamping CreatedAt + initial-news
+	// boundaries. Tests override it for determinism.
+	Now func() time.Time
 }
 
 func NewSubscriptionService(r *repo.Repo, s sms.Sender, l *slog.Logger) *SubscriptionService {
-	return &SubscriptionService{Repo: r, SMS: s, Log: l}
+	return &SubscriptionService{
+		Repo: r, SMS: s, Log: l,
+		InitialNewsDelay: 5 * time.Minute,
+		Now:              func() time.Time { return time.Now().UTC() },
+	}
 }
 
 // Create runs the full subscription happy path: validate, normalize phone,
@@ -87,11 +99,26 @@ func (s *SubscriptionService) Create(ctx context.Context, in SubscriptionInput) 
 		return nil, nil, err
 	}
 
+	now := s.now()
 	sub := &models.Subscription{
 		UserID:     user.ID,
 		TeamID:     team.ID,
 		UpdateType: in.UpdateType,
 		Frequency:  in.Frequency,
+		CreatedAt:  now,
+	}
+	// News and "both" subs get a deferred initial digest. Live-only subs
+	// flip the flag immediately so the digest worker never picks them up.
+	if in.UpdateType == models.UpdateNews || in.UpdateType == models.UpdateBoth {
+		delay := s.InitialNewsDelay
+		if delay <= 0 {
+			delay = 5 * time.Minute
+		}
+		notBefore := now.Add(delay)
+		sub.InitialNewsNotBefore = &notBefore
+		sub.InitialNewsSent = false
+	} else {
+		sub.InitialNewsSent = true
 	}
 	if err := s.Repo.CreateSubscription(ctx, sub); err != nil {
 		var pgErr *pgconn.PgError
@@ -118,6 +145,13 @@ func (s *SubscriptionService) Create(ctx context.Context, in SubscriptionInput) 
 	}
 
 	return sub, team, nil
+}
+
+func (s *SubscriptionService) now() time.Time {
+	if s.Now != nil {
+		return s.Now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 // buildConfirmation describes what the subscriber just signed up for in

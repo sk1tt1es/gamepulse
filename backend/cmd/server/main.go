@@ -55,23 +55,28 @@ func main() {
 	aiSummarizer := chooseAI(cfg, log)
 
 	subSvc := services.NewSubscriptionService(r, smsSender, log)
+	subSvc.InitialNewsDelay = cfg.InitialNewsDelay
 	dispatcher := services.NewDispatcher(r, smsSender, log)
 
 	server := api.New(r, subSvc, smsSender, log)
 
 	if cfg.EnableWorkers {
+		newsAgg := &workers.NewsAggregator{
+			Repo: r, News: newsProv, Log: log,
+			Interval: cfg.NewsAggregatorInterval,
+		}
 		go (&workers.LiveTracker{
 			Repo: r, Sports: sportsProv, Dispatcher: dispatcher, Log: log,
-			Interval: cfg.LiveTrackerInterval,
+			Interval:              cfg.LiveTrackerInterval,
+			FinishedGameRetention: cfg.FinishedGameRetention,
 		}).Run(ctx)
-		go (&workers.NewsAggregator{
-			Repo: r, News: newsProv, AI: aiSummarizer, Dispatcher: dispatcher, Log: log,
-			Interval: cfg.NewsAggregatorInterval,
-		}).Run(ctx)
+		go newsAgg.Run(ctx)
 		go (&workers.DigestBuilder{
-			Repo: r, SMS: smsSender, Log: log,
-			Interval: cfg.DigestInterval,
-			Now:      func() time.Time { return time.Now().UTC() },
+			Repo: r, SMS: smsSender, AI: aiSummarizer, Log: log,
+			News:             newsAgg,
+			Interval:         cfg.DigestInterval,
+			ArticleRetention: cfg.NewsArticleRetention,
+			Now:              func() time.Time { return time.Now().UTC() },
 		}).Run(ctx)
 	}
 

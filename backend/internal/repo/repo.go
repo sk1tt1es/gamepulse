@@ -114,6 +114,12 @@ func (r *Repo) GetTeam(ctx context.Context, id uuid.UUID) (*models.Team, error) 
 // CreateSubscription inserts a new subscription. The DB enforces uniqueness on
 // (user_id, team_id) so duplicate submissions return an error which the API
 // layer maps to 409 Conflict.
+//
+// Initial-news semantics:
+//   - Live-only subs are stored with initial_news_sent = true and
+//     initial_news_not_before = NULL — they never receive a news digest.
+//   - news / both subs receive an initial digest after a short cooldown
+//     (set by the caller via Subscription.InitialNewsNotBefore).
 func (r *Repo) CreateSubscription(ctx context.Context, s *models.Subscription) error {
 	if s.ID == uuid.Nil {
 		s.ID = uuid.New()
@@ -122,10 +128,47 @@ func (r *Repo) CreateSubscription(ctx context.Context, s *models.Subscription) e
 		s.CreatedAt = time.Now().UTC()
 	}
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO subscriptions (id, user_id, team_id, update_type, frequency, created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6)`,
-		s.ID, s.UserID, s.TeamID, s.UpdateType, s.Frequency, s.CreatedAt)
+		`INSERT INTO subscriptions (
+		     id, user_id, team_id, update_type, frequency, created_at,
+		     initial_news_sent, initial_news_not_before)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		s.ID, s.UserID, s.TeamID, s.UpdateType, s.Frequency, s.CreatedAt,
+		s.InitialNewsSent, s.InitialNewsNotBefore)
 	return err
+}
+
+// MarkInitialNewsSent flips the initial_news_sent flag so the next
+// digest tick won't re-pick the subscription for an initial send.
+func (r *Repo) MarkInitialNewsSent(ctx context.Context, subscriptionID uuid.UUID) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE subscriptions SET initial_news_sent = true WHERE id=$1`,
+		subscriptionID)
+	return err
+}
+
+// SubscriptionsDueForInitialNews returns every news/both subscription
+// whose +5m cooldown has elapsed and which has not yet received its
+// initial digest. The result is joined with user + team like
+// AllSubscriptions so the digest builder can format the SMS without
+// extra lookups.
+func (r *Repo) SubscriptionsDueForInitialNews(ctx context.Context, now time.Time) ([]models.SubscriptionDetail, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT s.id, s.user_id, s.team_id, s.update_type, s.frequency, s.created_at,
+		       s.initial_news_sent, s.initial_news_not_before,
+		       u.phone_number, t.name, t.league
+		FROM subscriptions s
+		JOIN users u ON u.id = s.user_id
+		JOIN teams t ON t.id = s.team_id
+		WHERE s.initial_news_sent = false
+		  AND s.initial_news_not_before IS NOT NULL
+		  AND s.initial_news_not_before <= $1
+		  AND s.update_type IN ('news','both')
+		ORDER BY s.initial_news_not_before ASC`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSubscriptionDetails(rows)
 }
 
 func (r *Repo) DeleteSubscription(ctx context.Context, id uuid.UUID) error {
@@ -148,6 +191,7 @@ func (r *Repo) SubscriptionsForTeam(ctx context.Context, teamID uuid.UUID, types
 	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT s.id, s.user_id, s.team_id, s.update_type, s.frequency, s.created_at,
+		       s.initial_news_sent, s.initial_news_not_before,
 		       u.phone_number, t.name, t.league
 		FROM subscriptions s
 		JOIN users u ON u.id = s.user_id
@@ -158,39 +202,46 @@ func (r *Repo) SubscriptionsForTeam(ctx context.Context, teamID uuid.UUID, types
 		return nil, err
 	}
 	defer rows.Close()
-	var out []models.SubscriptionDetail
-	for rows.Next() {
-		var sd models.SubscriptionDetail
-		if err := rows.Scan(&sd.ID, &sd.UserID, &sd.TeamID, &sd.UpdateType, &sd.Frequency, &sd.CreatedAt,
-			&sd.PhoneNumber, &sd.TeamName, &sd.League); err != nil {
-			return nil, err
-		}
-		out = append(out, sd)
-	}
-	return out, rows.Err()
+	return scanSubscriptionDetails(rows)
 }
 
 // AllSubscriptions returns every subscription joined with team + user. Used
 // by digest workers that iterate over all subscribers regardless of team.
+//
+// For digest cadence purposes we only return subs that have already had
+// their initial news send — initial sends are handled by a separate query
+// (SubscriptionsDueForInitialNews) so the recurring path does not double
+// up on the welcome digest.
 func (r *Repo) AllSubscriptions(ctx context.Context, freq models.Frequency) ([]models.SubscriptionDetail, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT s.id, s.user_id, s.team_id, s.update_type, s.frequency, s.created_at,
+		       s.initial_news_sent, s.initial_news_not_before,
 		       u.phone_number, t.name, t.league
 		FROM subscriptions s
 		JOIN users u ON u.id = s.user_id
 		JOIN teams t ON t.id = s.team_id
-		WHERE s.frequency = $1`, freq)
+		WHERE s.frequency = $1
+		  AND s.initial_news_sent = true`, freq)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanSubscriptionDetails(rows)
+}
+
+// scanSubscriptionDetails consolidates the per-row scan + nullable
+// timestamp handling shared across every subscription read query.
+func scanSubscriptionDetails(rows pgx.Rows) ([]models.SubscriptionDetail, error) {
 	var out []models.SubscriptionDetail
 	for rows.Next() {
 		var sd models.SubscriptionDetail
+		var notBefore *time.Time
 		if err := rows.Scan(&sd.ID, &sd.UserID, &sd.TeamID, &sd.UpdateType, &sd.Frequency, &sd.CreatedAt,
+			&sd.InitialNewsSent, &notBefore,
 			&sd.PhoneNumber, &sd.TeamName, &sd.League); err != nil {
 			return nil, err
 		}
+		sd.InitialNewsNotBefore = notBefore
 		out = append(out, sd)
 	}
 	return out, rows.Err()
@@ -288,6 +339,111 @@ func (r *Repo) RecentArticlesForTeam(ctx context.Context, teamID uuid.UUID, sinc
 		return nil, err
 	}
 	defer rows.Close()
+	return scanArticles(rows)
+}
+
+// UnsentArticlesForSubscription returns every article published after
+// `since` for the subscription's team that has NOT already been recorded
+// in subscription_article_sent for this subscription. This is the
+// per-subscriber feed that the digest builder summarizes at send time.
+func (r *Repo) UnsentArticlesForSubscription(
+	ctx context.Context,
+	subscriptionID, teamID uuid.UUID,
+	since time.Time,
+) ([]models.NewsArticle, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT a.id, a.team_id, a.title, a.content, a.source, a.url,
+		       a.published_at, a.summary
+		FROM news_articles a
+		WHERE a.team_id = $1
+		  AND a.published_at >= $2
+		  AND NOT EXISTS (
+		      SELECT 1 FROM subscription_article_sent sas
+		      WHERE sas.subscription_id = $3 AND sas.article_id = a.id)
+		ORDER BY a.published_at DESC`,
+		teamID, since, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanArticles(rows)
+}
+
+// MarkArticlesSent records that every supplied article was included in
+// a digest SMS for the subscription. Idempotent (ON CONFLICT DO NOTHING)
+// so a retry that re-runs the same batch is safe.
+func (r *Repo) MarkArticlesSent(
+	ctx context.Context,
+	subscriptionID uuid.UUID,
+	articleIDs []uuid.UUID,
+	at time.Time,
+) error {
+	if len(articleIDs) == 0 {
+		return nil
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	batch := &pgx.Batch{}
+	for _, aid := range articleIDs {
+		batch.Queue(`
+			INSERT INTO subscription_article_sent (subscription_id, article_id, sent_at)
+			VALUES ($1,$2,$3)
+			ON CONFLICT (subscription_id, article_id) DO NOTHING`,
+			subscriptionID, aid, at)
+	}
+	br := r.pool.SendBatch(ctx, batch)
+	defer br.Close()
+	for range articleIDs {
+		if _, err := br.Exec(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeleteFullyConsumedArticles removes every news article that no
+// remaining eligible subscriber still needs.
+//
+// "Eligible" = an active news/both subscription whose created_at is at or
+// before the article's published_at. Subscribers that signed up AFTER an
+// article was published would never have seen it in their initial digest
+// (which queries from created_at) so we don't keep articles around just
+// for them.
+//
+// Returns the number of rows deleted so the caller can emit a metric.
+func (r *Repo) DeleteFullyConsumedArticles(ctx context.Context) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM news_articles a
+		 WHERE NOT EXISTS (
+		     SELECT 1
+		       FROM subscriptions s
+		      WHERE s.team_id = a.team_id
+		        AND s.update_type IN ('news','both')
+		        AND s.created_at <= a.published_at
+		        AND NOT EXISTS (
+		            SELECT 1 FROM subscription_article_sent sas
+		             WHERE sas.subscription_id = s.id
+		               AND sas.article_id = a.id))`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// DeleteArticlesOlderThan is a TTL safety net: any news article older
+// than `cutoff` is deleted regardless of consumption state. Returns the
+// number of rows deleted.
+func (r *Repo) DeleteArticlesOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	tag, err := r.pool.Exec(ctx,
+		`DELETE FROM news_articles WHERE published_at < $1`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func scanArticles(rows pgx.Rows) ([]models.NewsArticle, error) {
 	var out []models.NewsArticle
 	for rows.Next() {
 		var a models.NewsArticle
@@ -298,6 +454,21 @@ func (r *Repo) RecentArticlesForTeam(ctx context.Context, teamID uuid.UUID, sinc
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// --- Game cleanup -------------------------------------------------------
+
+// DeleteFinishedGamesBefore removes finished games whose start_time is
+// strictly older than `cutoff`. Cascading FKs take care of the
+// associated game_events rows. Returns the number of games deleted.
+func (r *Repo) DeleteFinishedGamesBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	tag, err := r.pool.Exec(ctx,
+		`DELETE FROM games WHERE status = 'finished' AND start_time < $1`,
+		cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // --- Notifications -------------------------------------------------------
@@ -342,36 +513,3 @@ func (r *Repo) LastDigestSentAt(ctx context.Context, subscriptionID uuid.UUID) (
 	return *t, nil
 }
 
-// PendingForDigest returns content lines previously logged with the special
-// "pending" message_type so the digest builder can roll them up.
-func (r *Repo) PendingForDigest(ctx context.Context, subscriptionID uuid.UUID, since time.Time) ([]string, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT content FROM notifications_log
-		WHERE subscription_id=$1 AND message_type='pending' AND sent_at >= $2
-		ORDER BY sent_at ASC`,
-		subscriptionID, since)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var c string
-		if err := rows.Scan(&c); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
-}
-
-// ClearPending marks pending entries as consumed by changing their type. We
-// do this rather than deleting so we keep an audit trail.
-func (r *Repo) ClearPending(ctx context.Context, subscriptionID uuid.UUID, before time.Time) error {
-	_, err := r.pool.Exec(ctx, `
-		UPDATE notifications_log
-		SET message_type='digested'
-		WHERE subscription_id=$1 AND message_type='pending' AND sent_at < $2`,
-		subscriptionID, before)
-	return err
-}

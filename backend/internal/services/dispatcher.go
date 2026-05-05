@@ -10,14 +10,11 @@ import (
 	"github.com/gamepulse/backend/internal/repo"
 )
 
-// Dispatcher fans out a single notification to every matching subscriber.
-// It is responsible for idempotency (via dedupe keys) and routes messages
-// based on type:
+// Dispatcher fans out a single live-score notification to every matching
+// subscriber. It is responsible for idempotency (via dedupe keys).
 //
-//   - live score events → fire SMS immediately
-//   - news events       → log as "pending" so the digest builder can roll
-//                         them up at the subscriber's chosen daily / weekly
-//                         / monthly cadence
+// As of v3 only live-score events flow through the dispatcher. News is
+// summarised + sent at digest time inside DigestBuilder.
 //
 // Calls are safe to invoke concurrently. SMS sends happen in goroutines so a
 // slow upstream (e.g. Twilio) does not block the live tracker.
@@ -58,26 +55,6 @@ func (d *Dispatcher) send(
 	mt models.MessageType,
 	body, dedupeKey string,
 ) {
-	// Live score updates always fire immediately — the subscription's
-	// frequency field only governs news cadence. News notifications are
-	// queued as "pending" rows for the digest builder to roll up at the
-	// subscriber's chosen daily / weekly / monthly cadence.
-	immediate := mt == models.MessageLiveScore
-
-	if !immediate {
-		// Use a unique pending key to keep the dedupe constraint useful.
-		_, err := d.Repo.LogNotification(ctx, &models.NotificationLog{
-			SubscriptionID: s.ID,
-			MessageType:    "pending",
-			Content:        body,
-			DedupeKey:      "pending:" + dedupeKey,
-		})
-		if err != nil {
-			d.Log.Warn("queue pending failed", "err", err, "sub", s.ID)
-		}
-		return
-	}
-
 	inserted, err := d.Repo.LogNotification(ctx, &models.NotificationLog{
 		SubscriptionID: s.ID,
 		MessageType:    mt,

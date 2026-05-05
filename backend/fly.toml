@@ -12,9 +12,14 @@ primary_region = 'iad'
 [env]
   DIGEST_INTERVAL = '5m'
   ENABLE_WORKERS = 'true'
+  FINISHED_GAME_RETENTION = '24h'
   HTTP_ADDR = ':8080'
+  INITIAL_NEWS_DELAY = '5m'
   LIVE_TRACKER_INTERVAL = '10s'
-  NEWS_AGGREGATOR_INTERVAL = '30m'
+  # 6h is the spec target — news is summarised at SEND time so polling
+  # more often just spends NewsAPI quota for no SMS-side benefit.
+  NEWS_AGGREGATOR_INTERVAL = '6h'
+  NEWS_ARTICLE_RETENTION = '1440h'
   SPORTS_PROVIDER = 'espn'
 
 [http_service]
